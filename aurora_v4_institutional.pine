@@ -987,10 +987,8 @@ alertcondition(evtNewWall, "Aurora v4: new wall",       "Aurora v4 — new liqui
 alertcondition(evtDefend,  "Aurora v4: wall defended",  "Aurora v4 — shelf defended")
 alertcondition(evtBreak,   "Aurora v4: wall broken",    "Aurora v4 — shelf broken")
 alertcondition(evtFlip,    "Aurora v4: wall flipped",   "Aurora v4 — shelf polarity flipped")
-alertcondition(sigBuy,     "Aurora v4: BUY signal",
-     "Aurora v4 — BUY | Confluence: " + str.tostring(sigConfluence) + "% | " + syminfo.ticker)
-alertcondition(sigSell,    "Aurora v4: SELL signal",
-     "Aurora v4 — SELL | Confluence: " + str.tostring(sigConfluence) + "% | " + syminfo.ticker)
+alertcondition(sigBuy,     "Aurora v4: BUY signal",  "Aurora v4 — BUY entry triggered")
+alertcondition(sigSell,    "Aurora v4: SELL signal", "Aurora v4 — SELL entry triggered")
 
 
 // ═══════════════════════════════════════════════════════════════════════════
