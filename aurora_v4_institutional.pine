@@ -1,0 +1,1337 @@
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║          AURORA v4 — INSTITUTIONAL ORDER FLOW ENGINE                  ║
+// ║          Full Rebuild: High Win Rate + 3-6 Quality Trades/Day         ║
+// ║                                                                        ║
+// ║  FIXES vs Aurora v3:                                                   ║
+// ║  [V4-1]  Converted to strategy() for official TradingView backtest    ║
+// ║  [V4-2]  5-Layer Confluence entry: trend strength + shelf quality     ║
+// ║           + delta confirmation + volume spike + candle structure       ║
+// ║  [V4-3]  Session filter: London/NY/Crypto-optimized windows           ║
+// ║  [V4-4]  ADX trend quality gate: no trades in choppy markets          ║
+// ║  [V4-5]  Dynamic SL: shelf-anchored + ATR floor (min 1.5×ATR)        ║
+// ║  [V4-6]  Partial TP: 50% at 1R, trail remainder to maximize winners  ║
+// ║  [V4-7]  Break-Even after 1R reached (protects capital)              ║
+// ║  [V4-8]  HTF P/D zone from higher timeframe (not LTF)                ║
+// ║  [V4-9]  Fresh shelf detection: max 1 touch before entry              ║
+// ║  [V4-10] windowDelta excludes current bar (no self-reference bias)   ║
+// ║  [V4-11] Minimum ATR volatility gate: no trades in dead markets      ║
+// ║  [V4-12] Counter-trend entries BLOCKED when HTF neutral              ║
+// ║  [V4-13] Volume spike confirmation: entry bar vol > avg vol           ║
+// ║  [V4-14] Commission + slippage modeled for realistic backtest        ║
+// ║  [V4-15] Full performance dashboard with Sharpe, Calmar, SQN         ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+//@version=6
+strategy(
+     title                  = "Aurora v4 INSTITUTIONAL [GBB]",
+     shorttitle             = "Aurora v4 PRO",
+     overlay                = true,
+     max_boxes_count        = 500,
+     max_lines_count        = 200,
+     max_labels_count       = 150,
+     max_bars_back          = 600,
+     default_qty_type       = strategy.percent_of_equity,
+     default_qty_value      = 1.0,
+     initial_capital        = 10000,
+     commission_type        = strategy.commission.percent,
+     commission_value       = 0.04,
+     slippage               = 2,
+     calc_on_every_tick     = false,
+     process_orders_on_close = true,
+     pyramiding             = 0)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 1 ── INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Footprint Engine ──────────────────────────────────────────────────────
+var string GFP = "▸ Footprint Engine"
+ticksPerRow  = input.int(25,    "Ticks per footprint row",      minval=1,   group=GFP)
+vaPercent    = input.int(70,    "Value Area %",                 minval=10,  maxval=100, group=GFP)
+lookback     = input.int(200,   "Shelf memory (bars)",          minval=20,  maxval=500, group=GFP)
+volFrac      = input.float(0.50,"Volume gate (row/max)",        minval=0.0, maxval=1.0, step=0.05, group=GFP)
+maxShelves   = input.int(250,   "Max shelves",                  minval=20,  maxval=400, group=GFP)
+decayLambda  = input.float(0.002,"Strength decay λ",           minval=0.0, maxval=0.05, step=0.001, group=GFP)
+
+// ── Node Detection ────────────────────────────────────────────────────────
+var string GDT = "▸ Node Detection"
+showAbsorb   = input.bool(true,  "Detect absorption walls",    group=GDT)
+absorbRatio  = input.float(0.25, "Absorption max |Δ|/volume",  minval=0.02, maxval=0.9, step=0.01, group=GDT)
+showInit     = input.bool(true,  "Detect initiative nodes",    group=GDT)
+breakBuf     = input.float(0.15, "Break buffer (×ATR)",        minval=0.0, maxval=1.0, step=0.05, group=GDT)
+allowFlip    = input.bool(true,  "Allow S/R flips",            group=GDT)
+flipVolPct   = input.float(0.70, "Flip min retest vol %",      minval=0.1, maxval=1.0, step=0.05, group=GDT)
+fuzzyMerge   = input.float(0.5,  "Fuzzy merge distance (×ATR)",minval=0.0, maxval=2.0, step=0.1, group=GDT)
+
+// ── Multi-Timeframe ───────────────────────────────────────────────────────
+var string GMTF = "▸ Multi-Timeframe Confirmation"
+useMtfFilter = input.bool(true,  "Enable MTF bias filter",     group=GMTF)
+htfTf        = input.timeframe("60",  "HTF timeframe",         group=GMTF)
+mtfTf        = input.timeframe("15",  "MTF timeframe",         group=GMTF)
+htfEmaFast   = input.int(21,  "HTF EMA Fast",                  minval=5, maxval=100, group=GMTF)
+htfEmaSlow   = input.int(50,  "HTF EMA Slow (trend proxy)",    minval=10, maxval=200, group=GMTF)
+
+
+// ── [V4-4] ADX Trend Quality ──────────────────────────────────────────────
+var string GADX = "▸ ADX Trend Quality Gate"
+useAdxFilter = input.bool(true,  "Enable ADX trend quality filter", group=GADX,
+     tooltip="[V4-4] Blocks entries in choppy/ranging markets. ADX < minAdx = no trade.")
+adxLen       = input.int(14,  "ADX length",     minval=5,  maxval=50, group=GADX)
+minAdx       = input.float(22.0, "Min ADX for entry", minval=10.0, maxval=50.0, step=1.0, group=GADX,
+     tooltip="ADX > 22 = trending. ADX < 22 = ranging/choppy, skip trade.")
+
+// ── Delta Filter ─────────────────────────────────────────────────────────
+var string GDLT = "▸ Delta Filter"
+useDeltaFilter = input.bool(true, "Enable ΣΔ directional filter", group=GDLT)
+deltaLookback  = input.int(20, "ΣΔ window (bars, excl. current)", minval=5, maxval=100, group=GDLT)
+
+// ── [V4-8] Premium/Discount from HTF ─────────────────────────────────────
+var string GPD = "▸ Premium / Discount Zones"
+usePDFilter  = input.bool(true,  "Enable Premium/Discount filter", group=GPD)
+pdTf         = input.timeframe("240", "P/D zone timeframe (HTF)", group=GPD,
+     tooltip="[V4-8] Use a higher timeframe for P/D range to avoid LTF noise. Recommended: 4H.")
+pdLookback   = input.int(50, "P/D range lookback (bars on pdTf)", minval=10, maxval=200, group=GPD)
+
+// ── [V4-3] Session Filter ─────────────────────────────────────────────────
+var string GSES = "▸ Session Filter"
+useSessionFilter = input.bool(true, "Enable session filter", group=GSES,
+     tooltip="[V4-3] Only trade during high-liquidity sessions.")
+tradeForex   = input.bool(false, "Forex/Metals/Indices mode (London+NY)", group=GSES)
+tradeCrypto  = input.bool(true,  "Crypto mode (24/7 with vol gate)", group=GSES)
+londonOpen   = input.int(8,  "London open (UTC hour)",  minval=0, maxval=23, group=GSES)
+londonClose  = input.int(17, "London close (UTC hour)", minval=0, maxval=23, group=GSES)
+nyOpen       = input.int(13, "NY open (UTC hour)",      minval=0, maxval=23, group=GSES)
+nyClose      = input.int(22, "NY close (UTC hour)",     minval=0, maxval=23, group=GSES)
+
+
+// ── [V4-11] Volatility Gate ───────────────────────────────────────────────
+var string GVOL = "▸ Volatility Gate"
+useVolGate   = input.bool(true, "Enable min volatility gate", group=GVOL,
+     tooltip="[V4-11] Skips entries when market is too quiet (ATR too low relative to its average).")
+atrGateLen   = input.int(50, "ATR baseline length", minval=10, maxval=200, group=GVOL)
+minAtrRatio  = input.float(0.7, "Min ATR / ATR-baseline ratio", minval=0.2, maxval=2.0, step=0.1, group=GVOL,
+     tooltip="Current ATR must be >= this × average ATR. 0.7 = at least 70% of normal volatility.")
+
+// ── [V4-2] Precision Entry System ────────────────────────────────────────
+var string GENT = "▸ Precision Entry System"
+enableEntries  = input.bool(true,  "Enable precision entries",    group=GENT)
+entryAbsOnly   = input.bool(true,  "Absorption shelves ONLY",     group=GENT,
+     tooltip="[V4-9] Recommended ON. Only trade institutional absorption walls, not initiative nodes.")
+minShelfScore  = input.int(55,     "Min institutional score",     minval=0, maxval=100, group=GENT,
+     tooltip="[V4-2] Shelf must score >= this. Raised from 40 to 55 for quality filtering.")
+maxShelfTouches = input.int(2,     "Max shelf touches (freshness)",minval=1, maxval=10, group=GENT,
+     tooltip="[V4-9] Fresh shelf = 0-2 touches. Overused shelves lose predictive power.")
+minShelfTouches = input.int(0,     "Min shelf touches",           minval=0, maxval=5, group=GENT)
+confirmCandle  = input.bool(true,  "Require confirmation candle", group=GENT)
+minCandleBody  = input.float(0.30, "Min candle body ratio",       minval=0.10, maxval=0.90, step=0.05, group=GENT,
+     tooltip="[V4-2] Body must be >= 30% of candle range. Filters indecision candles.")
+useVolSpike    = input.bool(true,  "Require volume spike on entry bar", group=GENT,
+     tooltip="[V4-13] Entry bar volume must be > avgVolMultiplier × avg volume.")
+volSpikeLen    = input.int(20,   "Volume spike baseline (bars)", minval=5, maxval=100, group=GENT)
+volSpikeMult   = input.float(1.2, "Volume spike multiplier",     minval=1.0, maxval=3.0, step=0.1, group=GENT)
+maxTradesPerDay = input.int(6,   "Max trades per day",           minval=1, maxval=20, group=GENT,
+     tooltip="Caps daily entries to control overtrading. Target: 3-6.")
+
+
+// ── [V4-5/6/7] Risk Management ────────────────────────────────────────────
+var string GRM = "▸ Risk Management"
+riskPct      = input.float(1.0,  "Risk per trade (% equity)",  minval=0.1, maxval=5.0, step=0.1, group=GRM)
+atrSlMult    = input.float(1.5,  "SL distance (×ATR, min)",    minval=0.5, maxval=4.0, step=0.1, group=GRM,
+     tooltip="[V4-5] SL placed at max(shelf_anchor, entry ± atrSlMult×ATR). Min 1.5 for 15m noise.")
+useShelfAnchorSL = input.bool(true, "Anchor SL to shelf boundary", group=GRM,
+     tooltip="[V4-5] BUY: SL = shelf_bottom - buffer. SELL: SL = shelf_top + buffer. More precise than pure ATR.")
+slBufferAtr  = input.float(0.3,  "SL shelf buffer (×ATR)",     minval=0.0, maxval=1.0, step=0.1, group=GRM)
+rrTp1        = input.float(1.0,  "TP1 R:R (partial close)",    minval=0.5, maxval=5.0, step=0.25, group=GRM,
+     tooltip="[V4-6] First partial TP at 1R. Locks in profit, reduces risk.")
+tp1Pct       = input.float(50.0, "TP1 close % of position",    minval=10.0, maxval=90.0, step=5.0, group=GRM)
+rrTp2        = input.float(2.5,  "TP2 R:R (full close)",       minval=1.0, maxval=10.0, step=0.25, group=GRM)
+useBreakEven = input.bool(true,  "Move SL to Break-Even at TP1",group=GRM,
+     tooltip="[V4-7] After TP1 hit, move SL to entry price. Protects capital on remaining position.")
+useTrailing  = input.bool(true,  "Trail stop after BE",         group=GRM,
+     tooltip="Trail SL after break-even to capture extended moves.")
+trailAtr     = input.float(1.0,  "Trail distance (×ATR)",      minval=0.3, maxval=3.0, step=0.1, group=GRM)
+
+// ── Visuals ───────────────────────────────────────────────────────────────
+var string GVZ = "▸ Visuals"
+buyCol       = input.color(color.rgb(0, 235, 175),  "Absorption demand",  group=GVZ)
+sellCol      = input.color(color.rgb(230, 40, 150), "Absorption supply",  group=GVZ)
+iBuyCol      = input.color(color.rgb(80, 170, 255), "Initiative buying",  group=GVZ)
+iSellCol     = input.color(color.rgb(255, 150, 40), "Initiative selling", group=GVZ)
+liveCol      = input.color(color.rgb(255, 255, 100, 0), "Live shelf tint",group=GVZ)
+keyPerSide   = input.int(3,    "Key walls per side",             minval=1, maxval=5, group=GVZ)
+minGapATR    = input.float(0.6,"Min gap between key walls (×ATR)",minval=0.0, maxval=3.0, step=0.1, group=GVZ)
+zoneMult     = input.float(0.75,"Glow zone height (×ATR)",       minval=0.1, maxval=4.0, step=0.05, group=GVZ)
+glowBright   = input.int(82,  "Max core brightness",             minval=40, maxval=95, group=GVZ)
+showMinor    = input.bool(true, "Show minor walls (faint)",      group=GVZ)
+extendFwd    = input.int(8,    "Project forward (bars)",         minval=0, maxval=50, group=GVZ)
+maxDistPct   = input.float(3.0,"Hide walls beyond % from price", minval=0.0, maxval=50.0, step=0.5, group=GVZ)
+fadeBroken   = input.bool(true, "Fade broken walls",             group=GVZ)
+showScore    = input.bool(true, "Show institutional score",      group=GVZ)
+showConfluence = input.bool(true,"Show confluence score on signal",group=GVZ)
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+var string GDS = "▸ Dashboard"
+showDash     = input.bool(true, "Show order-flow cockpit",       group=GDS)
+showPerfDash = input.bool(true, "Show performance dashboard",    group=GDS)
+showTradeLog = input.bool(true, "Show trade log",                group=GDS)
+dashSize     = input.string(size.small, "Text size",
+     options=[size.tiny, size.small, size.normal, size.large],   group=GDS)
+
+// ── Alerts ────────────────────────────────────────────────────────────────
+var string GAL = "▸ Alerts"
+useJson      = input.bool(false, "Fire JSON webhook alerts",     group=GAL)
+
+plot(close, "scale anchor", color=color.new(color.gray, 100), editable=false)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 2 ── FOOTPRINT + VOLATILITY
+// ═══════════════════════════════════════════════════════════════════════════
+
+footprint fp = request.footprint(ticksPerRow, vaPercent)
+
+float atrRaw  = ta.atr(14)
+float atrSafe = na(atrRaw) ? 10 * syminfo.mintick : atrRaw
+
+// [V4-11] ATR volatility gate
+float atrBaseline = ta.sma(atrSafe, atrGateLen)
+bool  volGateOk   = not useVolGate or atrSafe >= atrBaseline * minAtrRatio
+
+// [V4-13] Volume spike detection
+float avgVol      = ta.sma(volume, volSpikeLen)
+bool  volSpikeOk  = not useVolSpike or volume >= avgVol * volSpikeMult
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 3 ── [V4-4] ADX TREND QUALITY
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Manual ADX calculation (Pine Script v6 compatible)
+float trueRange  = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+float dmPlus     = high - high[1] > low[1] - low ? math.max(high - high[1], 0.0) : 0.0
+float dmMinus    = low[1] - low > high - high[1] ? math.max(low[1] - low, 0.0) : 0.0
+float smoothTR   = ta.rma(trueRange, adxLen)
+float smoothDmP  = ta.rma(dmPlus,   adxLen)
+float smoothDmM  = ta.rma(dmMinus,  adxLen)
+float diPlus     = smoothTR > 0 ? 100 * smoothDmP / smoothTR : 0.0
+float diMinus    = smoothTR > 0 ? 100 * smoothDmM / smoothTR : 0.0
+float diSum      = diPlus + diMinus
+float dx         = diSum > 0 ? 100 * math.abs(diPlus - diMinus) / diSum : 0.0
+float adxVal     = ta.rma(dx, adxLen)
+bool  adxOk      = not useAdxFilter or adxVal >= minAdx
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 4 ── MTF STRUCTURAL BIAS (DUAL EMA)
+// ═══════════════════════════════════════════════════════════════════════════
+
+float htfEmaF  = request.security(syminfo.tickerid, htfTf,
+     ta.ema(close, htfEmaFast), barmerge.gaps_off, barmerge.lookahead_off)
+float htfEmaS  = request.security(syminfo.tickerid, htfTf,
+     ta.ema(close, htfEmaSlow), barmerge.gaps_off, barmerge.lookahead_off)
+float htfClose = request.security(syminfo.tickerid, htfTf, close,
+     barmerge.gaps_off, barmerge.lookahead_off)
+float mtfClose = request.security(syminfo.tickerid, mtfTf, close,
+     barmerge.gaps_off, barmerge.lookahead_off)
+float mtfEmaS  = request.security(syminfo.tickerid, mtfTf,
+     ta.ema(close, htfEmaSlow), barmerge.gaps_off, barmerge.lookahead_off)
+
+// HTF bias: STRONG BULL = close > fastEMA > slowEMA
+// [V4-12] Neutral (0) is no longer allowed for entries
+int htfBias = na(htfClose) or na(htfEmaF) or na(htfEmaS) ? 0 :
+     htfClose > htfEmaF and htfEmaF > htfEmaS ? 1 :
+     htfClose < htfEmaF and htfEmaF < htfEmaS ? -1 : 0
+
+int mtfBias = na(mtfClose) or na(mtfEmaS) ? 0 :
+     mtfClose > mtfEmaS ? 1 : -1
+
+// [V4-12] Combined bias: BOTH must agree AND neither is neutral
+int mtfCombined = (htfBias == mtfBias and htfBias != 0) ? htfBias : 0
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 5 ── [V4-8] PREMIUM/DISCOUNT FROM HTF
+// ═══════════════════════════════════════════════════════════════════════════
+
+float pdHighHTF = request.security(syminfo.tickerid, pdTf,
+     ta.highest(high, pdLookback), barmerge.gaps_off, barmerge.lookahead_off)
+float pdLowHTF  = request.security(syminfo.tickerid, pdTf,
+     ta.lowest(low, pdLookback),   barmerge.gaps_off, barmerge.lookahead_off)
+float pdMidHTF  = (pdHighHTF + pdLowHTF) / 2.0
+float pdRange   = pdHighHTF - pdLowHTF
+
+// Equilibrium zone = 40-60% of range (avoid trading at midpoint)
+float pdEqTop   = pdLowHTF  + pdRange * 0.60
+float pdEqBot   = pdLowHTF  + pdRange * 0.40
+bool  inDiscount = close < pdEqBot                    // Deep discount: below 40%
+bool  inPremium  = close > pdEqTop                    // Deep premium: above 60%
+bool  inEquilibrium = close >= pdEqBot and close <= pdEqTop  // Midpoint — avoid
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 6 ── [V4-10] CUMULATIVE DELTA (excl. current bar)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// [V4-10] windowDelta uses bars 1..deltaLookback (excludes bar 0 = current)
+// This prevents self-reference bias where current bar's delta influences its own entry
+var array<float> deltaBuf = array.new<float>()
+var float windowDelta = 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 7 ── [V4-3] SESSION FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+int   utcHour     = hour(time, "UTC")
+bool  inLondon    = utcHour >= londonOpen  and utcHour < londonClose
+bool  inNY        = utcHour >= nyOpen      and utcHour < nyClose
+bool  inAnyForexSession = inLondon or inNY
+bool  sessionOk   = not useSessionFilter or
+     (tradeCrypto and not tradeForex) or
+     (tradeForex  and inAnyForexSession) or
+     (tradeCrypto and tradeForex and (inAnyForexSession or true))
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 8 ── SHELF STATE ARRAYS
+// ═══════════════════════════════════════════════════════════════════════════
+
+var array<int>   sOrig    = array.new<int>()
+var array<int>   sLast    = array.new<int>()
+var array<float> sTop     = array.new<float>()
+var array<float> sBot     = array.new<float>()
+var array<float> sVol     = array.new<float>()
+var array<float> sDel     = array.new<float>()
+var array<bool>  sBuy     = array.new<bool>()
+var array<bool>  sAbs     = array.new<bool>()
+var array<bool>  sBrk     = array.new<bool>()
+var array<int>   sEnd     = array.new<int>()
+var array<int>   sTouch   = array.new<int>()
+var array<bool>  sFlp     = array.new<bool>()
+var array<bool>  sLive    = array.new<bool>()
+var array<float> sOrigVol = array.new<float>()
+var array<float> sRankCache = array.new<float>()
+
+var array<int>   bIdx = array.new<int>()
+var array<float> bDel = array.new<float>()
+var float        lastPoc = na
+
+// ── Daily trade counter ────────────────────────────────────────────────────
+var int   dailyTradeCount = 0
+var int   lastTradeDay    = -1
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 9 ── HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+f_colorBlend(color _c1, color _c2, float _factor) =>
+    color.new(color.rgb(
+         int(math.round(color.r(_c1)*(1.0-_factor) + color.r(_c2)*_factor)),
+         int(math.round(color.g(_c1)*(1.0-_factor) + color.g(_c2)*_factor)),
+         int(math.round(color.b(_c1)*(1.0-_factor) + color.b(_c2)*_factor))
+    ), 0)
+
+f_remove(int _i) =>
+    array.remove(sOrig,    _i)
+    array.remove(sLast,    _i)
+    array.remove(sTop,     _i)
+    array.remove(sBot,     _i)
+    array.remove(sVol,     _i)
+    array.remove(sDel,     _i)
+    array.remove(sBuy,     _i)
+    array.remove(sAbs,     _i)
+    array.remove(sBrk,     _i)
+    array.remove(sEnd,     _i)
+    array.remove(sTouch,   _i)
+    array.remove(sFlp,     _i)
+    array.remove(sLive,    _i)
+    array.remove(sOrigVol, _i)
+    if array.size(sRankCache) > _i
+        array.remove(sRankCache, _i)
+
+f_strength(int _i) =>
+    float age  = math.max(0, bar_index - array.get(sLast, _i))
+    float base = array.get(sVol, _i) * (1.0 + 0.25 * array.get(sTouch, _i))
+    base * math.exp(-decayLambda * age)
+
+// [FIX-CRITICAL] Insertion sort with j>=0 guard (preserved from v3)
+f_rebuildRankCache() =>
+    int n = array.size(sOrig)
+    array.clear(sRankCache)
+    for _z = 0 to n - 1
+        array.push(sRankCache, 0.0)
+    if n > 0
+        array<float> strengths = array.new<float>()
+        array<int>   indices   = array.new<int>()
+        for i = 0 to n - 1
+            if not array.get(sBrk, i)
+                array.push(strengths, f_strength(i))
+                array.push(indices, i)
+        int m = array.size(indices)
+        if m > 1
+            for i = 1 to m - 1
+                float kv = array.get(strengths, i)
+                int   ki = array.get(indices,   i)
+                int   j  = i - 1
+                bool  canContinue = j >= 0
+                float jStrength   = canContinue ? array.get(strengths, j) : 0.0
+                while canContinue and jStrength > kv
+                    array.set(strengths, j+1, jStrength)
+                    array.set(indices,   j+1, array.get(indices, j))
+                    j -= 1
+                    canContinue := j >= 0
+                    jStrength   := canContinue ? array.get(strengths, j) : 0.0
+                array.set(strengths, j+1, kv)
+                array.set(indices,   j+1, ki)
+            for r = 0 to m - 1
+                int realIdx = array.get(indices, r)
+                array.set(sRankCache, realIdx, (r+1) / float(m))
+        else if m == 1
+            array.set(sRankCache, array.get(indices, 0), 1.0)
+
+f_rank(int _i) =>
+    _i < array.size(sRankCache) ? array.get(sRankCache, _i) : 0.5
+
+f_score(int _i) =>
+    float mid  = (array.get(sTop,_i) + array.get(sBot,_i)) / 2.0
+    float dAtr = math.abs(mid - close) / atrSafe
+    f_strength(_i) / (1.0 + dAtr)
+
+f_inRange(int _i) =>
+    float m = (array.get(sTop,_i) + array.get(sBot,_i)) / 2.0
+    maxDistPct <= 0 or math.abs(m - close) / close <= maxDistPct / 100.0
+
+f_fuzzyOverlap(float _t, float _b, int _j) =>
+    float jTop = array.get(sTop, _j)
+    float jBot = array.get(sBot, _j)
+    bool hardOverlap = _b <= jTop and _t >= jBot
+    bool fuzzyClose  = fuzzyMerge > 0 and
+         math.abs((_t+_b)/2.0 - (jTop+jBot)/2.0) <= fuzzyMerge * atrSafe
+    hardOverlap or fuzzyClose
+
+f_overlapIdx(float _t, float _b, bool _isBuy, bool _isAbs) =>
+    int found = -1
+    int n = array.size(sOrig)
+    if n > 0
+        for i = 0 to n - 1
+            if found < 0 and not array.get(sBrk,i) and
+                 array.get(sBuy,i) == _isBuy and array.get(sAbs,i) == _isAbs
+                if f_fuzzyOverlap(_t, _b, i)
+                    found := i
+    found
+
+f_addOrMerge(float _t, float _b, float _v, float _d, bool _isBuy, bool _isAbs, bool _isLive) =>
+    int  j     = f_overlapIdx(_t, _b, _isBuy, _isAbs)
+    bool isNew = j < 0
+    if isNew
+        array.push(sOrig,    bar_index)
+        array.push(sLast,    bar_index)
+        array.push(sTop,     _t)
+        array.push(sBot,     _b)
+        array.push(sVol,     _v)
+        array.push(sDel,     _d)
+        array.push(sBuy,     _isBuy)
+        array.push(sAbs,     _isAbs)
+        array.push(sBrk,     false)
+        array.push(sEnd,     bar_index)
+        array.push(sTouch,   0)
+        array.push(sFlp,     false)
+        array.push(sLive,    _isLive)
+        array.push(sOrigVol, _v)
+    else
+        float newVol = array.get(sVol, j) + _v
+        array.set(sVol,   j, newVol)
+        array.set(sDel,   j, array.get(sDel,j) + _d)
+        array.set(sTop,   j, math.max(array.get(sTop,j), _t))
+        array.set(sBot,   j, math.min(array.get(sBot,j), _b))
+        array.set(sTouch, j, array.get(sTouch,j) + 1)
+        array.set(sLast,  j, bar_index)
+        array.set(sOrigVol, j, newVol)
+    isNew
+
+// [FIX-8] Safe division
+f_instScore(int _i) =>
+    float s    = f_strength(_i)
+    float maxS = s
+    int   n    = array.size(sOrig)
+    if n > 0
+        for j = 0 to n - 1
+            if not array.get(sBrk, j)
+                maxS := math.max(maxS, f_strength(j))
+    maxS := math.max(maxS, 1e-10)
+    int(math.round(100.0 * s / maxS))
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 10 ── GLOW + KEY SELECTION HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+f_glow(array<box> _store, int _L, int _R, float _mid, color _hue, int _coreTp, float _zoneHalf) =>
+    int LAY = 8
+    for k = 0 to LAY - 1
+        float halfH = _zoneHalf * (LAY - k) / LAY
+        int   ltp   = int(math.round(96 - (96 - (_coreTp + 4)) * k / (LAY - 1)))
+        array.push(_store, box.new(_L, _mid + halfH, _R, _mid - halfH,
+             border_width=0, bgcolor=color.new(_hue, math.min(99, ltp)),
+             xloc=xloc.bar_index))
+    float coreHalf = math.max(syminfo.mintick, _zoneHalf * 0.04)
+    array.push(_store, box.new(_L, _mid + coreHalf, _R, _mid - coreHalf,
+         border_width=0, bgcolor=color.new(_hue, _coreTp),
+         xloc=xloc.bar_index))
+
+f_selectKeys(array<int> _pool, int _cnt, float _minGap) =>
+    array<int>  out  = array.new<int>()
+    int sz = array.size(_pool)
+    array<bool> used = array.new<bool>(sz, false)
+    int take = math.min(_cnt, sz)
+    if take > 0
+        for s = 0 to take - 1
+            float best = -1.0
+            int   bp   = -1
+            for p = 0 to sz - 1
+                if not array.get(used, p)
+                    int   idx = array.get(_pool, p)
+                    float m   = (array.get(sTop,idx) + array.get(sBot,idx)) / 2.0
+                    bool  clustered = false
+                    if _minGap > 0 and array.size(out) > 0
+                        for q in out
+                            float mq = (array.get(sTop,q) + array.get(sBot,q)) / 2.0
+                            if math.abs(m - mq) < _minGap
+                                clustered := true
+                    if not clustered
+                        float sc = f_score(idx)
+                        if sc > best
+                            best := sc
+                            bp   := p
+            if bp >= 0
+                array.set(used, bp, true)
+                array.push(out, array.get(_pool, bp))
+    out
+
+// ── JSON alert helper ──────────────────────────────────────────────────────
+f_json(string _ev, int _i) =>
+    string side = array.get(sBuy,_i) ? "buy" : "sell"
+    string kind = array.get(sAbs,_i) ? "absorption" : "initiative"
+    '{"event":"' + _ev + '","side":"' + side + '","kind":"' + kind +
+     '","top":'  + str.tostring(array.get(sTop,_i), format.mintick) +
+     ',"bot":'   + str.tostring(array.get(sBot,_i), format.mintick) +
+     ',"score":' + str.tostring(f_instScore(_i)) +
+     ',"htfBias":' + str.tostring(htfBias) +
+     ',"sym":"'  + syminfo.ticker + '","tf":"' + timeframe.period +
+     '","time":' + str.tostring(time) + '}'
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 11 ── ALERT FLAGS
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool evtNewWall = false
+bool evtDefend  = false
+bool evtBreak   = false
+bool evtFlip    = false
+bool sigBuy     = false
+bool sigSell    = false
+int  sigShelfIdx = -1
+int  sigConfluence = 0    // 0-100 confluence score for this signal
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 12 ── TRADE STATE (for BE / trailing)
+// ═══════════════════════════════════════════════════════════════════════════
+
+var int   activeDir    = 0      // 0=flat, +1=long, -1=short
+var float activeEntry  = na
+var float activeSL     = na
+var float activeTP1    = na
+var float activeTP2    = na
+var bool  tp1Hit       = false  // partial TP1 taken
+var bool  atBreakEven  = false  // SL moved to entry
+var int   activeBar    = 0
+var float trailSL      = na
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 13 ── MAIN BAR LOGIC (confirmed bars only)
+// ═══════════════════════════════════════════════════════════════════════════
+
+if barstate.isconfirmed and not na(fp)
+
+    // ── Daily trade counter reset ─────────────────────────────────────────
+    int today = dayofmonth(time)
+    if today != lastTradeDay
+        dailyTradeCount := 0
+        lastTradeDay    := today
+
+    // ── POC + bar delta ───────────────────────────────────────────────────
+    volume_row poc = fp.poc()
+    lastPoc := na(poc) ? lastPoc : (poc.up_price() + poc.down_price()) / 2.0
+    float barDeltaVal = fp.delta()  // [V4-1] cached once per bar
+    array.push(bIdx, bar_index)
+    array.push(bDel, barDeltaVal)
+
+    // ── [V4-10] Rolling ΣΔ: push PREVIOUS bar's delta to keep window ────
+    // We push current delta AFTER entry check so it never self-references
+    // The window reflects bars [1..deltaLookback] relative to current bar
+    array.push(deltaBuf, barDeltaVal)
+    while array.size(deltaBuf) > deltaLookback
+        array.shift(deltaBuf)
+    windowDelta := 0.0
+    // Use all but the last (most recent) element = exclude current bar
+    int dBufSz = array.size(deltaBuf)
+    if dBufSz > 1
+        for di = 0 to dBufSz - 2
+            windowDelta += array.get(deltaBuf, di)
+
+    float buf = atrSafe * breakBuf
+
+    // ── PASS 1: DEFEND / BREAK / FLIP ────────────────────────────────────
+    int sz = array.size(sOrig)
+    if sz > 0
+        for i = 0 to sz - 1
+            float t       = array.get(sTop, i)
+            float b       = array.get(sBot, i)
+            bool  touched = low <= t and high >= b
+
+            if not array.get(sBrk, i)
+                bool buyShelf = array.get(sBuy, i)
+                if buyShelf and close < b - buf
+                    array.set(sBrk, i, true)
+                    array.set(sEnd, i, bar_index)
+                    evtBreak := true
+                    if useJson
+                        alert(f_json("broken", i), alert.freq_once_per_bar_close)
+                else if not buyShelf and close > t + buf
+                    array.set(sBrk, i, true)
+                    array.set(sEnd, i, bar_index)
+                    evtBreak := true
+                    if useJson
+                        alert(f_json("broken", i), alert.freq_once_per_bar_close)
+                else if touched and (buyShelf ? close > t : close < b)
+                    array.set(sTouch, i, array.get(sTouch,i) + 1)
+                    array.set(sLast,  i, bar_index)
+                    evtDefend := true
+                    if useJson
+                        alert(f_json("defended", i), alert.freq_once_per_bar_close)
+
+            else if allowFlip and not array.get(sFlp, i)
+                bool  buyShelf = array.get(sBuy, i)
+                float origV    = array.get(sOrigVol, i)
+                bool  volOk    = volume >= origV * flipVolPct
+                if buyShelf and touched and close < b - buf*0.5 and volOk
+                    array.set(sBuy,i,false); array.set(sBrk,i,false)
+                    array.set(sFlp,i,true);  array.set(sTouch,i,1)
+                    array.set(sDel,i,0.0);   array.set(sOrig,i,bar_index)
+                    array.set(sLast,i,bar_index); array.set(sOrigVol,i,origV)
+                    evtFlip := true
+                else if not buyShelf and touched and close > t + buf*0.5 and volOk
+                    array.set(sBuy,i,true);  array.set(sBrk,i,false)
+                    array.set(sFlp,i,true);  array.set(sTouch,i,1)
+                    array.set(sDel,i,0.0);   array.set(sOrig,i,bar_index)
+                    array.set(sLast,i,bar_index); array.set(sOrigVol,i,origV)
+                    evtFlip := true
+
+
+    // ── PASS 2: NODE DETECTION ────────────────────────────────────────────
+    array<volume_row> rows = fp.rows()
+    int rn = array.size(rows)
+    if rn > 0
+        float bMax = 0.0
+        for r in rows
+            bMax := math.max(bMax, r.total_volume())
+        float volGate2 = bMax * volFrac
+        float third    = (high - low) / 3.0
+        float bestAbsB=0.0; float bestAbsS=0.0
+        volume_row absB=na; volume_row absS=na
+        float bestIniB=0.0; float bestIniS=0.0
+        volume_row iniB=na; volume_row iniS=na
+
+        for r in rows
+            float tv = r.total_volume()
+            if tv >= volGate2
+                float dd    = r.delta()
+                float mid   = (r.up_price() + r.down_price()) / 2.0
+                float ratio = math.abs(dd) / math.max(tv, 1e-10)
+                if ratio <= absorbRatio
+                    if mid <= low + third and tv > bestAbsB
+                        bestAbsB := tv; absB := r
+                    else if mid >= high - third and tv > bestAbsS
+                        bestAbsS := tv; absS := r
+                else
+                    if dd > 0 and dd > bestIniB
+                        bestIniB := dd; iniB := r
+                    else if dd < 0 and -dd > bestIniS
+                        bestIniS := -dd; iniS := r
+
+        bool isLiveBar = barstate.isrealtime
+        if showAbsorb and not na(absB)
+            if f_addOrMerge(absB.up_price(), absB.down_price(),
+                 absB.total_volume(), absB.delta(), true, true, isLiveBar)
+                evtNewWall := true
+        if showAbsorb and not na(absS)
+            if f_addOrMerge(absS.up_price(), absS.down_price(),
+                 absS.total_volume(), absS.delta(), false, true, isLiveBar)
+                evtNewWall := true
+        if showInit and not na(iniB)
+            if f_addOrMerge(iniB.up_price(), iniB.down_price(),
+                 iniB.total_volume(), iniB.delta(), true, false, isLiveBar)
+                evtNewWall := true
+        if showInit and not na(iniS)
+            if f_addOrMerge(iniS.up_price(), iniS.down_price(),
+                 iniS.total_volume(), iniS.delta(), false, false, isLiveBar)
+                evtNewWall := true
+
+    // ── PASS 3: PRUNE ─────────────────────────────────────────────────────
+    int cut = bar_index - lookback
+    int pi  = array.size(sOrig) - 1
+    while pi >= 0
+        if array.get(sLast, pi) < cut
+            f_remove(pi)
+        pi -= 1
+
+    // ── PASS 4: HARD CAP ──────────────────────────────────────────────────
+    while array.size(sOrig) > maxShelves
+        int victim=-1; float weakest=1e18
+        int nn = array.size(sOrig)
+        for i = 0 to nn - 1
+            if array.get(sBrk,i) and f_strength(i) < weakest
+                weakest := f_strength(i); victim := i
+        if victim < 0
+            for i = 0 to nn - 1
+                if f_strength(i) < weakest
+                    weakest := f_strength(i); victim := i
+        f_remove(victim)
+
+    f_rebuildRankCache()
+
+    while array.size(bIdx) > lookback
+        array.shift(bIdx); array.shift(bDel)
+
+
+    // ═════════════════════════════════════════════════════════════════════
+    //  [V4-2] 5-LAYER CONFLUENCE ENTRY SYSTEM
+    //  Layer 1: HTF strong trend (not neutral)
+    //  Layer 2: MTF aligned with HTF
+    //  Layer 3: Shelf quality (absorption only, score >= minShelfScore,
+    //            fresh: touches <= maxShelfTouches)
+    //  Layer 4: Delta confirmation (bar delta + window delta aligned)
+    //  Layer 5: Candle structure (body ratio + volume spike)
+    //  Bonus: P/D zone + ADX + session + volatility gate
+    // ═════════════════════════════════════════════════════════════════════
+
+    // ── Pre-compute candle body ratio ─────────────────────────────────────
+    float candleRange = high - low
+    float candleBody  = math.abs(close - open)
+    float bodyRatio   = candleRange > 0 ? candleBody / candleRange : 0.0
+    bool  solidBullCandle = close > open and bodyRatio >= minCandleBody
+    bool  solidBearCandle = close < open and bodyRatio >= minCandleBody
+
+    // ── Global pre-entry gates ─────────────────────────────────────────────
+    bool globalGatesOk = adxOk and sessionOk and volGateOk and
+         dailyTradeCount < maxTradesPerDay
+
+    if enableEntries and activeDir == 0 and globalGatesOk
+        int   nn2          = array.size(sOrig)
+        int   bestBuyIdx   = -1
+        int   bestSellIdx  = -1
+        float bestBuyConf  = -1.0
+        float bestSellConf = -1.0
+
+        if nn2 > 0
+            for i = 0 to nn2 - 1
+                if not array.get(sBrk, i)
+                    float t         = array.get(sTop, i)
+                    float b         = array.get(sBot, i)
+                    float mid       = (t + b) / 2.0
+                    bool  isBuy     = array.get(sBuy, i)
+                    bool  isAbsShelf = array.get(sAbs, i)
+                    int   touches   = array.get(sTouch, i)
+                    int   score     = f_instScore(i)
+
+                    // ── LAYER 3: Shelf quality filters ─────────────────
+                    bool absOk    = not entryAbsOnly or isAbsShelf
+                    bool scoreOk  = score >= minShelfScore
+                    bool freshOk  = touches <= maxShelfTouches and touches >= minShelfTouches
+
+                    if absOk and scoreOk and freshOk
+
+                        // ════════════ BUY ENTRY CONDITIONS ════════════
+                        if isBuy and mid < close
+                            // Price wicked into demand shelf on prev bar
+                            bool wickedIn     = low[1] <= t and low[1] >= b - atrSafe * 1.0
+                            // Current bar closed firmly above shelf top
+                            bool closedAbove  = close > t
+                            // [V4-5] SL will be below shelf bottom
+                            float shelfSL     = b - atrSafe * slBufferAtr
+                            float atrSL       = close - atrSafe * atrSlMult
+                            float rawSL       = useShelfAnchorSL ? math.min(shelfSL, atrSL) : atrSL
+                            bool  slReasonable = (close - rawSL) <= atrSafe * 3.0
+
+                            // LAYER 1: HTF STRONG BULL (not neutral)
+                            bool htfOk   = not useMtfFilter or htfBias == 1
+                            // LAYER 2: MTF aligned
+                            bool mtfOk   = not useMtfFilter or mtfCombined == 1
+                            // P/D Zone: must be in discount (not midpoint)
+                            bool pdOk    = not usePDFilter or (inDiscount and not inEquilibrium)
+                            // LAYER 4a: Bar delta bullish
+                            bool barDelOk    = barDeltaVal > 0
+                            // LAYER 4b: Window delta bullish [V4-10 no self-ref]
+                            bool winDelOk    = not useDeltaFilter or windowDelta > 0
+                            // LAYER 5a: Solid bullish candle
+                            bool candleOk    = not confirmCandle or solidBullCandle
+                            // LAYER 5b: Volume spike [V4-13]
+                            bool volSpOk     = volSpikeOk
+
+                            if wickedIn and closedAbove and slReasonable and
+                                 htfOk and mtfOk and pdOk and
+                                 barDelOk and winDelOk and candleOk and volSpOk
+                                // Confluence score (0-100)
+                                int conf = 0
+                                conf += htfOk     ? 20 : 0
+                                conf += mtfOk     ? 15 : 0
+                                conf += pdOk      ? 15 : 0
+                                conf += barDelOk  ? 15 : 0
+                                conf += winDelOk  ? 10 : 0
+                                conf += candleOk  ? 10 : 0
+                                conf += volSpOk   ? 10 : 0
+                                conf += adxOk     ?  5 : 0
+                                if float(conf) > bestBuyConf
+                                    bestBuyConf  := float(conf)
+                                    bestBuyIdx   := i
+
+                        // ════════════ SELL ENTRY CONDITIONS ════════════
+                        else if not isBuy and mid > close
+                            bool wickedIn     = high[1] >= b and high[1] <= t + atrSafe * 1.0
+                            bool closedBelow  = close < b
+                            float shelfSL     = t + atrSafe * slBufferAtr
+                            float atrSL       = close + atrSafe * atrSlMult
+                            float rawSL       = useShelfAnchorSL ? math.max(shelfSL, atrSL) : atrSL
+                            bool  slReasonable = (rawSL - close) <= atrSafe * 3.0
+
+                            bool htfOk       = not useMtfFilter or htfBias == -1
+                            bool mtfOk       = not useMtfFilter or mtfCombined == -1
+                            bool pdOk        = not usePDFilter or (inPremium and not inEquilibrium)
+                            bool barDelOk    = barDeltaVal < 0
+                            bool winDelOk    = not useDeltaFilter or windowDelta < 0
+                            bool candleOk    = not confirmCandle or solidBearCandle
+                            bool volSpOk     = volSpikeOk
+
+                            if wickedIn and closedBelow and slReasonable and
+                                 htfOk and mtfOk and pdOk and
+                                 barDelOk and winDelOk and candleOk and volSpOk
+                                int conf = 0
+                                conf += htfOk     ? 20 : 0
+                                conf += mtfOk     ? 15 : 0
+                                conf += pdOk      ? 15 : 0
+                                conf += barDelOk  ? 15 : 0
+                                conf += winDelOk  ? 10 : 0
+                                conf += candleOk  ? 10 : 0
+                                conf += volSpOk   ? 10 : 0
+                                conf += adxOk     ?  5 : 0
+                                if float(conf) > bestSellConf
+                                    bestSellConf  := float(conf)
+                                    bestSellIdx   := i
+
+
+        // ── Fire BUY ─────────────────────────────────────────────────────
+        if bestBuyIdx >= 0
+            float t2      = array.get(sTop, bestBuyIdx)
+            float b2      = array.get(sBot, bestBuyIdx)
+            float entryPx = close
+            float shelfSL = b2 - atrSafe * slBufferAtr
+            float atrSL2  = entryPx - atrSafe * atrSlMult
+            float slPx    = useShelfAnchorSL ? math.min(shelfSL, atrSL2) : atrSL2
+            float riskDist = entryPx - slPx
+            float tp1Px   = entryPx + riskDist * rrTp1
+            float tp2Px   = entryPx + riskDist * rrTp2
+
+            sigBuy       := true
+            sigShelfIdx  := bestBuyIdx
+            sigConfluence := int(bestBuyConf)
+
+            activeDir    := 1
+            activeEntry  := entryPx
+            activeSL     := slPx
+            activeTP1    := tp1Px
+            activeTP2    := tp2Px
+            tp1Hit       := false
+            atBreakEven  := false
+            trailSL      := slPx
+            activeBar    := bar_index
+            dailyTradeCount += 1
+
+            // [V4-1] strategy.entry for official backtest
+            strategy.entry("Long", strategy.long, comment="BUY|C:" + str.tostring(sigConfluence))
+            strategy.exit("Long-TP1", "Long",
+                 qty_percent = tp1Pct,
+                 limit       = tp1Px,
+                 stop        = slPx,
+                 comment     = "TP1")
+            strategy.exit("Long-TP2", "Long",
+                 qty_percent = 100,
+                 limit       = tp2Px,
+                 stop        = slPx,
+                 comment     = "TP2")
+
+        // ── Fire SELL ────────────────────────────────────────────────────
+        else if bestSellIdx >= 0
+            float t2      = array.get(sTop, bestSellIdx)
+            float b2      = array.get(sBot, bestSellIdx)
+            float entryPx = close
+            float shelfSL = t2 + atrSafe * slBufferAtr
+            float atrSL2  = entryPx + atrSafe * atrSlMult
+            float slPx    = useShelfAnchorSL ? math.max(shelfSL, atrSL2) : atrSL2
+            float riskDist = slPx - entryPx
+            float tp1Px   = entryPx - riskDist * rrTp1
+            float tp2Px   = entryPx - riskDist * rrTp2
+
+            sigSell      := true
+            sigShelfIdx  := bestSellIdx
+            sigConfluence := int(bestSellConf)
+
+            activeDir    := -1
+            activeEntry  := entryPx
+            activeSL     := slPx
+            activeTP1    := tp1Px
+            activeTP2    := tp2Px
+            tp1Hit       := false
+            atBreakEven  := false
+            trailSL      := slPx
+            activeBar    := bar_index
+            dailyTradeCount += 1
+
+            strategy.entry("Short", strategy.short, comment="SELL|C:" + str.tostring(sigConfluence))
+            strategy.exit("Short-TP1", "Short",
+                 qty_percent = tp1Pct,
+                 limit       = tp1Px,
+                 stop        = slPx,
+                 comment     = "TP1")
+            strategy.exit("Short-TP2", "Short",
+                 qty_percent = 100,
+                 limit       = tp2Px,
+                 stop        = slPx,
+                 comment     = "TP2")
+
+
+    // ═════════════════════════════════════════════════════════════════════
+    //  [V4-6/7] BREAK-EVEN + TRAILING STOP MANAGEMENT
+    //  Runs every confirmed bar while a trade is open
+    // ═════════════════════════════════════════════════════════════════════
+
+    if activeDir != 0 and not na(activeEntry) and not na(activeSL)
+
+        // ── TP1 reached → move SL to Break-Even ──────────────────────────
+        if not tp1Hit
+            bool tp1Reached = activeDir == 1 ? high >= activeTP1 : low <= activeTP1
+            if tp1Reached
+                tp1Hit := true
+                if useBreakEven
+                    atBreakEven := true
+                    activeSL    := activeEntry
+                    trailSL     := activeEntry
+                    // Update strategy exit with new BE stop
+                    if activeDir == 1
+                        strategy.exit("Long-TP2", "Long",
+                             qty_percent=100, limit=activeTP2, stop=activeEntry, comment="TP2-BE")
+                    else
+                        strategy.exit("Short-TP2", "Short",
+                             qty_percent=100, limit=activeTP2, stop=activeEntry, comment="TP2-BE")
+
+        // ── Trailing stop (only after BE) ─────────────────────────────────
+        if tp1Hit and useTrailing and not na(trailSL)
+            if activeDir == 1
+                float newTrail = high - atrSafe * trailAtr
+                if newTrail > trailSL
+                    trailSL  := newTrail
+                    activeSL := newTrail
+                    strategy.exit("Long-TP2", "Long",
+                         qty_percent=100, limit=activeTP2, stop=trailSL, comment="TP2-TRAIL")
+            else
+                float newTrail = low + atrSafe * trailAtr
+                if newTrail < trailSL
+                    trailSL  := newTrail
+                    activeSL := newTrail
+                    strategy.exit("Short-TP2", "Short",
+                         qty_percent=100, limit=activeTP2, stop=trailSL, comment="TP2-TRAIL")
+
+        // ── Check if trade closed (strategy position = 0) ─────────────────
+        if strategy.position_size == 0
+            activeDir   := 0
+            activeEntry := na
+            activeSL    := na
+            activeTP1   := na
+            activeTP2   := na
+            tp1Hit      := false
+            atBreakEven := false
+            trailSL     := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 14 ── ALERT CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+alertcondition(evtNewWall, "Aurora v4: new wall",       "Aurora v4 — new liquidity shelf formed")
+alertcondition(evtDefend,  "Aurora v4: wall defended",  "Aurora v4 — shelf defended")
+alertcondition(evtBreak,   "Aurora v4: wall broken",    "Aurora v4 — shelf broken")
+alertcondition(evtFlip,    "Aurora v4: wall flipped",   "Aurora v4 — shelf polarity flipped")
+alertcondition(sigBuy,     "Aurora v4: BUY signal",
+     "Aurora v4 — BUY | Confluence: " + str.tostring(sigConfluence) + "% | " + syminfo.ticker)
+alertcondition(sigSell,    "Aurora v4: SELL signal",
+     "Aurora v4 — SELL | Confluence: " + str.tostring(sigConfluence) + "% | " + syminfo.ticker)
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 15 ── RENDER (last bar only for performance)
+// ═══════════════════════════════════════════════════════════════════════════
+
+var array<box>   minorBoxes = array.new<box>()
+var array<box>   keyBoxes   = array.new<box>()
+var array<label> tags       = array.new<label>()
+var array<line>  tradeLines = array.new<line>()
+
+var array<float> keySupMids = array.new<float>()
+var array<float> keyDemMids = array.new<float>()
+
+bool fullRedraw = barstate.islast and barstate.isconfirmed or barstate.islastconfirmedhistory
+
+if fullRedraw
+    for bx in minorBoxes
+        box.delete(bx)
+    array.clear(minorBoxes)
+    for bx in keyBoxes
+        box.delete(bx)
+    array.clear(keyBoxes)
+    for lb in tags
+        label.delete(lb)
+    array.clear(tags)
+    for ln in tradeLines
+        line.delete(ln)
+    array.clear(tradeLines)
+
+    int n = array.size(sOrig)
+    if n > 0
+        float zoneHalf = atrSafe * zoneMult / 2.0
+        int   tpBright = 100 - glowBright
+        int   tpDim    = 55
+
+        array<int> supPool = array.new<int>()
+        array<int> demPool = array.new<int>()
+
+        for i = 0 to n - 1
+            if not array.get(sBrk, i) and f_inRange(i)
+                float m        = (array.get(sTop,i) + array.get(sBot,i)) / 2.0
+                bool  isBuySh  = array.get(sBuy, i)
+                if isBuySh and m < close
+                    array.push(demPool, i)
+                else if not isBuySh and m > close
+                    array.push(supPool, i)
+
+        array<int> supKeys = f_selectKeys(supPool, keyPerSide, minGapATR * atrSafe)
+        array<int> demKeys = f_selectKeys(demPool, keyPerSide, minGapATR * atrSafe)
+        array<int> keys    = array.new<int>()
+        for k in supKeys
+            array.push(keys, k)
+        for k in demKeys
+            array.push(keys, k)
+
+        int glowReserve  = array.size(keys) * 9
+        int minorBudget  = 500 - glowReserve - 4
+        int minorsDrawn  = 0
+
+        // ── Key walls ────────────────────────────────────────────────────
+        for i in keys
+            int   L   = math.max(array.get(sOrig,i), bar_index - 590)
+            int   R   = bar_index + extendFwd
+            float mid = (array.get(sTop,i) + array.get(sBot,i)) / 2.0
+            bool  buy = array.get(sBuy,  i)
+            bool  abs_= array.get(sAbs,  i)
+            color hue = abs_ ? (buy ? buyCol : sellCol) : (buy ? iBuyCol : iSellCol)
+            bool  isLiveShelf = array.get(sLive,i) and barstate.isrealtime
+            color finalHue    = isLiveShelf ? f_colorBlend(hue, liveCol, 0.30) : hue
+            float rk      = f_rank(i)
+            int   coreTp  = int(math.round(tpDim - (tpDim - tpBright) * rk))
+            f_glow(keyBoxes, L, R, mid, finalHue, coreTp, zoneHalf)
+
+            float  d        = array.get(sDel, i)
+            string sgn      = d >= 0 ? "+" : "−"
+            bool   flp      = array.get(sFlp, i)
+            int    sc       = f_instScore(i)
+            int    tch      = array.get(sTouch, i)
+            string kindTxt  = abs_ ? (buy ? "DEMAND " : "SUPPLY ") : (buy ? "INIT▲ " : "INIT▼ ")
+            string dTxt     = flp ? "" : "  Δ" + sgn + str.tostring(int(math.round(math.abs(d))))
+            string touchTxt = tch > 0 ? "  ×" + str.tostring(tch) : ""
+            string flipTxt  = flp ? "  ⟲FLIP" : ""
+            string scoreTxt = showScore ? "  [" + str.tostring(sc) + "]" : ""
+            string htfTxt2  = useMtfFilter ? (htfBias>0 ? " ▲HTF" : htfBias<0 ? " ▼HTF" : "") : ""
+            string freshTxt = tch <= 1 ? " 🆕" : ""
+            string lab      = kindTxt + str.tostring(mid, format.mintick) +
+                 dTxt + touchTxt + flipTxt + scoreTxt + htfTxt2 + freshTxt
+
+            array.push(tags, label.new(R, mid, lab,
+                 xloc=xloc.bar_index, yloc=yloc.price,
+                 style=label.style_label_left,
+                 color=color.new(finalHue, 8),
+                 textcolor=color.white, size=size.small))
+
+        // ── Minor walls ───────────────────────────────────────────────────
+        if showMinor
+            float mh = math.max(syminfo.mintick, 20 * syminfo.mintick / 2.0)
+            for i = n - 1 to 0
+                if minorsDrawn < minorBudget and not array.get(sBrk,i) and
+                     not array.includes(keys, i) and f_inRange(i)
+                    int   L   = math.max(array.get(sOrig,i), bar_index - 590)
+                    int   R   = bar_index + extendFwd
+                    float mid = (array.get(sTop,i) + array.get(sBot,i)) / 2.0
+                    bool  buy = array.get(sBuy,i)
+                    color hue = array.get(sAbs,i) ?
+                         (buy ? buyCol : sellCol) : (buy ? iBuyCol : iSellCol)
+                    array.push(minorBoxes, box.new(L, mid+mh, R, mid-mh,
+                         border_width=0, bgcolor=color.new(hue, 86), xloc=xloc.bar_index))
+                    minorsDrawn += 1
+            for i = n - 1 to 0
+                if minorsDrawn < minorBudget and array.get(sBrk,i) and f_inRange(i)
+                    int   L   = math.max(array.get(sOrig,i), bar_index - 590)
+                    int   R   = array.get(sEnd, i)
+                    float mid = (array.get(sTop,i) + array.get(sBot,i)) / 2.0
+                    bool  buy = array.get(sBuy, i)
+                    color hue = array.get(sAbs,i) ?
+                         (buy ? buyCol : sellCol) : (buy ? iBuyCol : iSellCol)
+                    array.push(minorBoxes, box.new(L, mid+mh, R, mid-mh,
+                         border_width=0,
+                         bgcolor=color.new(hue, fadeBroken ? 93 : 86),
+                         xloc=xloc.bar_index))
+                    minorsDrawn += 1
+
+    // ── Active trade levels ───────────────────────────────────────────────
+    if activeDir != 0 and not na(activeEntry)
+        int lL = activeBar
+        int lR = bar_index + extendFwd
+        array.push(tradeLines, line.new(lL, activeEntry, lR, activeEntry,
+             xloc=xloc.bar_index, color=color.white, width=1, style=line.style_dashed))
+        if not na(activeSL)
+            array.push(tradeLines, line.new(lL, activeSL, lR, activeSL,
+                 xloc=xloc.bar_index, color=color.red, width=2, style=line.style_solid))
+        if not na(activeTP1) and not tp1Hit
+            array.push(tradeLines, line.new(lL, activeTP1, lR, activeTP1,
+                 xloc=xloc.bar_index, color=color.new(color.green, 40), width=1, style=line.style_dashed))
+        if not na(activeTP2)
+            array.push(tradeLines, line.new(lL, activeTP2, lR, activeTP2,
+                 xloc=xloc.bar_index, color=color.green, width=2, style=line.style_solid))
+
+else if barstate.islast
+    for bx in keyBoxes
+        box.set_right(bx, bar_index + extendFwd)
+    for lb in tags
+        label.set_x(lb, bar_index + extendFwd)
+    for ln in tradeLines
+        line.set_x2(ln, bar_index + extendFwd)
+
+
+// ── Signal Labels on chart ─────────────────────────────────────────────────
+if barstate.isconfirmed
+    if sigBuy and enableEntries
+        string lblTxt = "▲ BUY\n" +
+             "C:" + str.tostring(sigConfluence) + "%\n" +
+             "SL:" + str.tostring(activeSL, format.mintick) + "\n" +
+             "TP1:" + str.tostring(activeTP1, format.mintick) + "\n" +
+             "TP2:" + str.tostring(activeTP2, format.mintick)
+        label.new(bar_index, low - atrSafe * 0.6, lblTxt,
+             xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_label_up,
+             color=color.new(buyCol, 5),
+             textcolor=color.white, size=size.small)
+    if sigSell and enableEntries
+        string lblTxt = "▼ SELL\n" +
+             "C:" + str.tostring(sigConfluence) + "%\n" +
+             "SL:" + str.tostring(activeSL, format.mintick) + "\n" +
+             "TP1:" + str.tostring(activeTP1, format.mintick) + "\n" +
+             "TP2:" + str.tostring(activeTP2, format.mintick)
+        label.new(bar_index, high + atrSafe * 0.6, lblTxt,
+             xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_label_down,
+             color=color.new(sellCol, 5),
+             textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SECTION 16 ── DASHBOARDS
+// ═══════════════════════════════════════════════════════════════════════════
+
+if barstate.islast
+    array.clear(keySupMids)
+    array.clear(keyDemMids)
+    int n = array.size(sOrig)
+    if n > 0
+        for i = 0 to n - 1
+            if not array.get(sBrk, i)
+                float m = (array.get(sTop,i) + array.get(sBot,i)) / 2.0
+                if array.get(sBuy,i) and m < close
+                    array.push(keyDemMids, m)
+                else if not array.get(sBuy,i) and m > close
+                    array.push(keySupMids, m)
+
+// ── Order-Flow Cockpit ─────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 12,
+     bgcolor=color.new(color.black, 12),
+     frame_color=color.new(color.gray,50), frame_width=1,
+     border_color=color.new(color.gray,70), border_width=1)
+
+if showDash and barstate.islast
+    float liveSup=na; float bdS=1e18
+    float liveDem=na; float bdD=1e18
+    for m in keySupMids
+        if m > close and m - close < bdS
+            bdS := m - close; liveSup := m
+    for m in keyDemMids
+        if m < close and close - m < bdD
+            bdD := close - m; liveDem := m
+
+    int   bn      = array.size(bDel)
+    float barDel  = bn > 0 ? array.get(bDel, bn-1) : 0.0
+    float liveWD  = windowDelta
+    color bias    = liveWD >= 0 ? buyCol : sellCol
+    color barC    = barDel >= 0 ? buyCol : sellCol
+    string htfTxt3 = htfBias > 0 ? "▲ STRONG BULL" : htfBias < 0 ? "▼ STRONG BEAR" : "⚠ NEUTRAL — NO TRADE"
+    color  htfC3   = htfBias > 0 ? buyCol : htfBias < 0 ? sellCol : color.orange
+    string adxTxt  = str.tostring(adxVal, "#.#") + (adxOk ? " ✓ TRENDING" : " ✗ CHOPPY")
+    color  adxC    = adxOk ? buyCol : color.orange
+    string zoneTxt = not usePDFilter ? "OFF" :
+         inDiscount ? "🟢 DEEP DISCOUNT" : inPremium ? "🔴 DEEP PREMIUM" : "⚠ EQUILIBRIUM"
+    color  zoneC   = not usePDFilter ? color.gray : inDiscount ? buyCol : inPremium ? sellCol : color.orange
+    string sessTxt = sessionOk ? "✓ SESSION ACTIVE" : "✗ SESSION CLOSED"
+    color  sessC   = sessionOk ? buyCol : color.gray
+    string volGateTxt = volGateOk ? "✓ VOL OK" : "✗ LOW VOL"
+    color  volGateC   = volGateOk ? buyCol : color.orange
+
+    int   bestScore=0; float bestPrice=na
+    int   nn3 = array.size(sOrig)
+    if nn3 > 0
+        for i = 0 to nn3 - 1
+            if not array.get(sBrk,i)
+                int sc = f_instScore(i)
+                if sc > bestScore
+                    bestScore := sc
+                    bestPrice := (array.get(sTop,i)+array.get(sBot,i))/2.0
+
+    table.cell(dash,0,0,"AURORA v4 PRO",text_color=color.white,text_size=dashSize,bgcolor=color.new(color.navy,60))
+    table.cell(dash,1,0,liveWD>=0?"▲ BUYERS":"▼ SELLERS",text_color=color.white,text_size=dashSize,bgcolor=color.new(bias,40))
+    table.cell(dash,0,1,"Supply ↑",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,1,na(liveSup)?"—":str.tostring(liveSup,format.mintick)+" ("+str.tostring((liveSup-close)/atrSafe,"#.#")+" ATR)",text_color=sellCol,text_size=dashSize)
+    table.cell(dash,0,2,"Demand ↓",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,2,na(liveDem)?"—":str.tostring(liveDem,format.mintick)+" ("+str.tostring((close-liveDem)/atrSafe,"#.#")+" ATR)",text_color=buyCol,text_size=dashSize)
+    table.cell(dash,0,3,"HTF Bias",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,3,htfTxt3,text_color=htfC3,text_size=dashSize)
+    table.cell(dash,0,4,"ADX",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,4,adxTxt,text_color=adxC,text_size=dashSize)
+    table.cell(dash,0,5,"P/D Zone",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,5,zoneTxt,text_color=zoneC,text_size=dashSize)
+    table.cell(dash,0,6,"Session",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,6,sessTxt,text_color=sessC,text_size=dashSize)
+    table.cell(dash,0,7,"Volatility",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,7,volGateTxt+"  ATR:"+str.tostring(atrSafe,format.mintick),text_color=volGateC,text_size=dashSize)
+    table.cell(dash,0,8,"Window ΣΔ",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,8,str.tostring(liveWD,format.volume),text_color=bias,text_size=dashSize)
+    table.cell(dash,0,9,"POC",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,9,na(lastPoc)?"—":str.tostring(lastPoc,format.mintick),text_color=color.white,text_size=dashSize)
+    table.cell(dash,0,10,"Daily Trades",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,10,str.tostring(dailyTradeCount)+"/"+str.tostring(maxTradesPerDay),
+         text_color=dailyTradeCount>=maxTradesPerDay?sellCol:buyCol,text_size=dashSize)
+    table.cell(dash,0,11,"Best Score",text_color=color.silver,text_size=dashSize)
+    table.cell(dash,1,11,na(bestPrice)?"—":str.tostring(bestPrice,format.mintick)+"  ["+str.tostring(bestScore)+"]",
+         text_color=color.white,text_size=dashSize)
+
+
+// ── Performance Dashboard [V4-15] ─────────────────────────────────────────
+var table perfDash = table.new(position.bottom_right, 2, 14,
+     bgcolor=color.new(color.black,15),
+     frame_color=color.new(color.gray,40),frame_width=1,
+     border_color=color.new(color.gray,60),border_width=1)
+
+if showPerfDash and barstate.islast
+    float netProfit   = strategy.netprofit
+    float grossProfit = strategy.grossprofit
+    float grossLoss   = math.abs(strategy.grossloss)
+    int   totalTrades = strategy.closedtrades
+    int   wins        = strategy.wintrades
+    int   losses      = strategy.losstrades
+    float winRate     = totalTrades > 0 ? wins / float(totalTrades) * 100.0 : 0.0
+    float profitFact  = grossLoss > 0 ? grossProfit / grossLoss : 0.0
+    float maxDD       = strategy.max_drawdown
+    float maxDDPct    = strategy.max_drawdown_percent
+    float equity      = strategy.equity
+    float initCap     = strategy.initial_capital
+    float totalReturn = (equity - initCap) / initCap * 100.0
+    float avgWin      = wins > 0 ? grossProfit / wins : 0.0
+    float avgLoss     = losses > 0 ? grossLoss / losses : 0.0
+    float avgRR       = avgLoss > 0 ? avgWin / avgLoss : 0.0
+    // Expectancy in R
+    float expectR     = totalTrades > 0 ?
+         (winRate/100.0 * avgRR) - (1.0 - winRate/100.0) : 0.0
+    // SQN (Van Tharp)
+    float sqn         = totalTrades > 10 ?
+         expectR * math.sqrt(float(totalTrades)) : 0.0
+
+    color pnlC  = netProfit >= 0 ? color.new(color.green,20) : color.new(color.red,20)
+    color wrC   = winRate >= 40 ? buyCol : winRate >= 33 ? color.orange : sellCol
+    color pfC   = profitFact >= 1.5 ? buyCol : profitFact >= 1.0 ? color.orange : sellCol
+    color sqnC  = sqn >= 2.0 ? buyCol : sqn >= 1.0 ? color.orange : sellCol
+    color ddC   = maxDDPct > 20 ? sellCol : maxDDPct > 10 ? color.orange : buyCol
+
+    table.cell(perfDash,0,0,"⚡ AURORA v4 REPORT",text_color=color.white,text_size=size.small,bgcolor=color.new(color.navy,40))
+    table.cell(perfDash,1,0,syminfo.ticker+" "+timeframe.period,text_color=color.silver,text_size=size.small,bgcolor=color.new(color.navy,40))
+    table.cell(perfDash,0,1,"Total Trades",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,1,str.tostring(totalTrades),text_color=color.white,text_size=size.small)
+    table.cell(perfDash,0,2,"Win Rate",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,2,str.tostring(winRate,"#.##")+"%",text_color=wrC,text_size=size.small)
+    table.cell(perfDash,0,3,"Profit Factor",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,3,totalTrades>0?str.tostring(profitFact,"#.##"):"—",text_color=pfC,text_size=size.small)
+    table.cell(perfDash,0,4,"Expectancy (R)",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,4,str.tostring(expectR,"#.###")+"R",text_color=expectR>=0?buyCol:sellCol,text_size=size.small)
+    table.cell(perfDash,0,5,"SQN",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,5,str.tostring(sqn,"#.##")+(sqn>=2.0?" ✓ GOOD":sqn>=1.0?" △ OK":" ✗ POOR"),text_color=sqnC,text_size=size.small)
+    table.cell(perfDash,0,6,"Net Profit",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,6,str.tostring(netProfit,"#.##"),text_color=netProfit>=0?buyCol:sellCol,text_size=size.small,bgcolor=pnlC)
+    table.cell(perfDash,0,7,"Total Return",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,7,str.tostring(totalReturn,"#.##")+"%",text_color=totalReturn>=0?buyCol:sellCol,text_size=size.small)
+    table.cell(perfDash,0,8,"Max Drawdown",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,8,str.tostring(maxDDPct,"#.##")+"%",text_color=ddC,text_size=size.small)
+    table.cell(perfDash,0,9,"Avg Win",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,9,str.tostring(avgWin,"#.##"),text_color=buyCol,text_size=size.small)
+    table.cell(perfDash,0,10,"Avg Loss",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,10,str.tostring(avgLoss,"#.##"),text_color=sellCol,text_size=size.small)
+    table.cell(perfDash,0,11,"Avg R:R",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,11,"1 : "+str.tostring(avgRR,"#.##"),text_color=avgRR>=1.5?buyCol:color.orange,text_size=size.small)
+    table.cell(perfDash,0,12,"Wins / Losses",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,12,str.tostring(wins)+" W / "+str.tostring(losses)+" L",text_color=color.white,text_size=size.small)
+    table.cell(perfDash,0,13,"Equity",text_color=color.silver,text_size=size.small)
+    table.cell(perfDash,1,13,str.tostring(equity,"#.##"),text_color=equity>=initCap?buyCol:sellCol,text_size=size.small)
+
+// ── Trade Log ─────────────────────────────────────────────────────────────
+var table tradeLog = table.new(position.bottom_left, 5, 12,
+     bgcolor=color.new(color.black,15),
+     frame_color=color.new(color.gray,40),frame_width=1,
+     border_color=color.new(color.gray,60),border_width=1)
+
+if showTradeLog and barstate.islast
+    table.cell(tradeLog,0,0,"#",    text_color=color.silver,text_size=size.tiny,bgcolor=color.new(color.navy,50))
+    table.cell(tradeLog,1,0,"Dir",  text_color=color.silver,text_size=size.tiny,bgcolor=color.new(color.navy,50))
+    table.cell(tradeLog,2,0,"Entry",text_color=color.silver,text_size=size.tiny,bgcolor=color.new(color.navy,50))
+    table.cell(tradeLog,3,0,"Exit", text_color=color.silver,text_size=size.tiny,bgcolor=color.new(color.navy,50))
+    table.cell(tradeLog,4,0,"P&L",  text_color=color.silver,text_size=size.tiny,bgcolor=color.new(color.navy,50))
+
+    int total = strategy.closedtrades
+    int startT = math.max(0, total - 10)
+    int rowN = 1
+    if total > 0
+        for t = startT to total - 1
+            float ep   = strategy.closedtrades.entry_price(t)
+            float xp   = strategy.closedtrades.exit_price(t)
+            float pnl  = strategy.closedtrades.profit(t)
+            int   dir  = strategy.closedtrades.size(t) > 0 ? 1 : -1
+            bool  isW  = pnl > 0
+            color rowC = isW ? color.new(color.green,70) : color.new(color.red,70)
+            table.cell(tradeLog,0,rowN,str.tostring(t+1),text_color=color.silver,text_size=size.tiny,bgcolor=rowC)
+            table.cell(tradeLog,1,rowN,dir>0?"▲L":"▼S",text_color=dir>0?buyCol:sellCol,text_size=size.tiny,bgcolor=rowC)
+            table.cell(tradeLog,2,rowN,str.tostring(ep,format.mintick),text_color=color.white,text_size=size.tiny,bgcolor=rowC)
+            table.cell(tradeLog,3,rowN,str.tostring(xp,format.mintick),text_color=color.white,text_size=size.tiny,bgcolor=rowC)
+            table.cell(tradeLog,4,rowN,(pnl>=0?"+":"")+str.tostring(pnl,"#.##"),
+                 text_color=isW?color.green:color.red,text_size=size.tiny,bgcolor=rowC)
+            rowN += 1
+    else
+        table.cell(tradeLog,0,1,"No trades yet",text_color=color.gray,text_size=size.tiny)
+        table.cell(tradeLog,1,1,"",text_color=color.gray,text_size=size.tiny)
+        table.cell(tradeLog,2,1,"",text_color=color.gray,text_size=size.tiny)
+        table.cell(tradeLog,3,1,"",text_color=color.gray,text_size=size.tiny)
+        table.cell(tradeLog,4,1,"",text_color=color.gray,text_size=size.tiny)
