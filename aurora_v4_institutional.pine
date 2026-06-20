@@ -66,7 +66,7 @@ fuzzyMerge   = input.float(0.5,  "Fuzzy merge distance (×ATR)",minval=0.0, maxv
 
 // ── Multi-Timeframe ───────────────────────────────────────────────────────
 var string GMTF = "▸ Multi-Timeframe Confirmation"
-useMtfFilter = input.bool(true,  "Enable MTF bias filter",     group=GMTF)
+useMtfFilter = input.bool(false,  "Enable MTF bias filter",     group=GMTF)
 htfTf        = input.timeframe("60",  "HTF timeframe",         group=GMTF)
 mtfTf        = input.timeframe("15",  "MTF timeframe",         group=GMTF)
 htfEmaFast   = input.int(21,  "HTF EMA Fast",                  minval=5, maxval=100, group=GMTF)
@@ -75,7 +75,7 @@ htfEmaSlow   = input.int(50,  "HTF EMA Slow (trend proxy)",    minval=10, maxval
 
 // ── [V4-4] ADX Trend Quality ──────────────────────────────────────────────
 var string GADX = "▸ ADX Trend Quality Gate"
-useAdxFilter = input.bool(true,  "Enable ADX trend quality filter", group=GADX,
+useAdxFilter = input.bool(false,  "Enable ADX trend quality filter", group=GADX,
      tooltip="[V4-4] Blocks entries in choppy/ranging markets. ADX < minAdx = no trade.")
 adxLen       = input.int(14,  "ADX length",     minval=5,  maxval=50, group=GADX)
 minAdx       = input.float(22.0, "Min ADX for entry", minval=10.0, maxval=50.0, step=1.0, group=GADX,
@@ -83,12 +83,12 @@ minAdx       = input.float(22.0, "Min ADX for entry", minval=10.0, maxval=50.0, 
 
 // ── Delta Filter ─────────────────────────────────────────────────────────
 var string GDLT = "▸ Delta Filter"
-useDeltaFilter = input.bool(true, "Enable ΣΔ directional filter", group=GDLT)
+useDeltaFilter = input.bool(false, "Enable ΣΔ directional filter", group=GDLT)
 deltaLookback  = input.int(20, "ΣΔ window (bars, excl. current)", minval=5, maxval=100, group=GDLT)
 
 // ── [V4-8] Premium/Discount from HTF ─────────────────────────────────────
 var string GPD = "▸ Premium / Discount Zones"
-usePDFilter  = input.bool(true,  "Enable Premium/Discount filter", group=GPD)
+usePDFilter  = input.bool(false,  "Enable Premium/Discount filter", group=GPD)
 pdTf         = input.timeframe("240", "P/D zone timeframe (HTF)", group=GPD,
      tooltip="[V4-8] Use a higher timeframe for P/D range to avoid LTF noise. Recommended: 4H.")
 pdLookback   = input.int(50, "P/D range lookback (bars on pdTf)", minval=10, maxval=200, group=GPD)
@@ -107,7 +107,7 @@ nyClose      = input.int(22, "NY close (UTC hour)",     minval=0, maxval=23, gro
 
 // ── [V4-11] Volatility Gate ───────────────────────────────────────────────
 var string GVOL = "▸ Volatility Gate"
-useVolGate   = input.bool(true, "Enable min volatility gate", group=GVOL,
+useVolGate   = input.bool(false, "Enable min volatility gate", group=GVOL,
      tooltip="[V4-11] Skips entries when market is too quiet (ATR too low relative to its average).")
 atrGateLen   = input.int(50, "ATR baseline length", minval=10, maxval=200, group=GVOL)
 minAtrRatio  = input.float(0.7, "Min ATR / ATR-baseline ratio", minval=0.2, maxval=2.0, step=0.1, group=GVOL,
@@ -116,18 +116,18 @@ minAtrRatio  = input.float(0.7, "Min ATR / ATR-baseline ratio", minval=0.2, maxv
 // ── [V4-2] Precision Entry System ────────────────────────────────────────
 var string GENT = "▸ Precision Entry System"
 enableEntries  = input.bool(true,  "Enable precision entries",    group=GENT)
-entryAbsOnly   = input.bool(true,  "Absorption shelves ONLY",     group=GENT,
-     tooltip="[V4-9] Recommended ON. Only trade institutional absorption walls, not initiative nodes.")
-minShelfScore  = input.int(55,     "Min institutional score",     minval=0, maxval=100, group=GENT,
-     tooltip="[V4-2] Shelf must score >= this. Raised from 40 to 55 for quality filtering.")
-maxShelfTouches = input.int(2,     "Max shelf touches (freshness)",minval=1, maxval=10, group=GENT,
-     tooltip="[V4-9] Fresh shelf = 0-2 touches. Overused shelves lose predictive power.")
+entryAbsOnly   = input.bool(false,  "Absorption shelves ONLY",     group=GENT,
+     tooltip="[V4-9] If ON: only trade absorption walls. OFF allows initiative nodes too.")
+minShelfScore  = input.int(30,      "Min institutional score",     minval=0, maxval=100, group=GENT,
+     tooltip="[V4-2] Shelf must score >= this. 30 is balanced — raise for higher quality only.")
+maxShelfTouches = input.int(5,     "Max shelf touches (freshness)",minval=1, maxval=20, group=GENT,
+     tooltip="[V4-9] Shelf tested up to this many times. Higher = more signals.")
 minShelfTouches = input.int(0,     "Min shelf touches",           minval=0, maxval=5, group=GENT)
-confirmCandle  = input.bool(true,  "Require confirmation candle", group=GENT)
+confirmCandle  = input.bool(false,  "Require confirmation candle", group=GENT)
 minCandleBody  = input.float(0.30, "Min candle body ratio",       minval=0.10, maxval=0.90, step=0.05, group=GENT,
      tooltip="[V4-2] Body must be >= 30% of candle range. Filters indecision candles.")
-useVolSpike    = input.bool(true,  "Require volume spike on entry bar", group=GENT,
-     tooltip="[V4-13] Entry bar volume must be > avgVolMultiplier × avg volume.")
+useVolSpike    = input.bool(false,  "Require volume spike on entry bar", group=GENT,
+     tooltip="[V4-13] If ON: entry bar volume must be > multiplier × avg volume. OFF = no volume gate.")
 volSpikeLen    = input.int(20,   "Volume spike baseline (bars)", minval=5, maxval=100, group=GENT)
 volSpikeMult   = input.float(1.2, "Volume spike multiplier",     minval=1.0, maxval=3.0, step=0.1, group=GENT)
 maxTradesPerDay = input.int(6,   "Max trades per day",           minval=1, maxval=20, group=GENT,
@@ -771,29 +771,30 @@ if barstate.isconfirmed and not na(fp)
 
                         // ════════════ BUY ENTRY CONDITIONS ════════════
                         if isBuy and mid < close
-                            // Price wicked into demand shelf on prev bar
-                            bool wickedIn     = low[1] <= t and low[1] >= b - atrSafe * 1.0
-                            // Current bar closed firmly above shelf top
-                            bool closedAbove  = close > t
-                            // [V4-5] SL will be below shelf bottom
+                            // [FIX] Price touched demand shelf on current OR prev bar
+                            bool wickedIn     = (low[1] <= t and high[1] >= b) or
+                                                (low    <= t and high    >= b)
+                            // Current bar closed above shelf midpoint (relaxed from top)
+                            bool closedAbove  = close > mid
+                            // [V4-5] SL below shelf bottom
                             float shelfSL     = b - atrSafe * slBufferAtr
                             float atrSL       = close - atrSafe * atrSlMult
                             float rawSL       = useShelfAnchorSL ? math.min(shelfSL, atrSL) : atrSL
-                            bool  slReasonable = (close - rawSL) <= atrSafe * 3.0
+                            bool  slReasonable = (close - rawSL) <= atrSafe * 4.0
 
-                            // LAYER 1: HTF STRONG BULL (not neutral)
-                            bool htfOk   = not useMtfFilter or htfBias == 1
-                            // LAYER 2: MTF aligned
-                            bool mtfOk   = not useMtfFilter or mtfCombined == 1
-                            // P/D Zone: must be in discount (not midpoint)
-                            bool pdOk    = not usePDFilter or (inDiscount and not inEquilibrium)
-                            // LAYER 4a: Bar delta bullish
-                            bool barDelOk    = barDeltaVal > 0
-                            // LAYER 4b: Window delta bullish [V4-10 no self-ref]
-                            bool winDelOk    = not useDeltaFilter or windowDelta > 0
-                            // LAYER 5a: Solid bullish candle
-                            bool candleOk    = not confirmCandle or solidBullCandle
-                            // LAYER 5b: Volume spike [V4-13]
+                            // LAYER 1: HTF BULL (>=0 allows neutral too)
+                            bool htfOk   = not useMtfFilter or htfBias >= 0
+                            // LAYER 2: MTF not strongly bearish
+                            bool mtfOk   = not useMtfFilter or mtfBias >= 0
+                            // P/D Zone: discount OR equilibrium (not premium)
+                            bool pdOk    = not usePDFilter or not inPremium
+                            // LAYER 4a: Bar delta bullish OR neutral
+                            bool barDelOk    = barDeltaVal >= 0
+                            // LAYER 4b: Window delta bullish [V4-10]
+                            bool winDelOk    = not useDeltaFilter or windowDelta >= 0
+                            // LAYER 5a: Close above open (basic bull)
+                            bool candleOk    = not confirmCandle or close >= open
+                            // LAYER 5b: Volume spike
                             bool volSpOk     = volSpikeOk
 
                             if wickedIn and closedAbove and slReasonable and
@@ -815,19 +816,26 @@ if barstate.isconfirmed and not na(fp)
 
                         // ════════════ SELL ENTRY CONDITIONS ════════════
                         else if not isBuy and mid > close
-                            bool wickedIn     = high[1] >= b and high[1] <= t + atrSafe * 1.0
-                            bool closedBelow  = close < b
+                            // [FIX] Price touched supply shelf on current OR prev bar
+                            bool wickedIn     = (high[1] >= b and low[1] <= t) or
+                                                (high    >= b and low    <= t)
+                            // Current bar closed below shelf midpoint (relaxed from bottom)
+                            bool closedBelow  = close < mid
                             float shelfSL     = t + atrSafe * slBufferAtr
                             float atrSL       = close + atrSafe * atrSlMult
                             float rawSL       = useShelfAnchorSL ? math.max(shelfSL, atrSL) : atrSL
-                            bool  slReasonable = (rawSL - close) <= atrSafe * 3.0
+                            bool  slReasonable = (rawSL - close) <= atrSafe * 4.0
 
-                            bool htfOk       = not useMtfFilter or htfBias == -1
-                            bool mtfOk       = not useMtfFilter or mtfCombined == -1
-                            bool pdOk        = not usePDFilter or (inPremium and not inEquilibrium)
-                            bool barDelOk    = barDeltaVal < 0
-                            bool winDelOk    = not useDeltaFilter or windowDelta < 0
-                            bool candleOk    = not confirmCandle or solidBearCandle
+                            // HTF BEAR or neutral
+                            bool htfOk       = not useMtfFilter or htfBias <= 0
+                            // MTF not strongly bullish
+                            bool mtfOk       = not useMtfFilter or mtfBias <= 0
+                            // P/D: premium OR equilibrium (not discount)
+                            bool pdOk        = not usePDFilter or not inDiscount
+                            // Bar delta bearish or neutral
+                            bool barDelOk    = barDeltaVal <= 0
+                            bool winDelOk    = not useDeltaFilter or windowDelta <= 0
+                            bool candleOk    = not confirmCandle or close <= open
                             bool volSpOk     = volSpikeOk
 
                             if wickedIn and closedBelow and slReasonable and
