@@ -24,7 +24,7 @@
 //@version=6
 strategy(
      title                  = "Aurora v4 INSTITUTIONAL [GBB]",
-     shorttitle             = "Aurora v4 PRO",
+     shorttitle             = "AuroraV4",
      overlay                = true,
      max_boxes_count        = 500,
      max_lines_count        = 200,
@@ -613,16 +613,24 @@ if barstate.isconfirmed and not na(fp)
                 float origV    = array.get(sOrigVol, i)
                 bool  volOk    = volume >= origV * flipVolPct
                 if buyShelf and touched and close < b - buf*0.5 and volOk
-                    array.set(sBuy,i,false); array.set(sBrk,i,false)
-                    array.set(sFlp,i,true);  array.set(sTouch,i,1)
-                    array.set(sDel,i,0.0);   array.set(sOrig,i,bar_index)
-                    array.set(sLast,i,bar_index); array.set(sOrigVol,i,origV)
+                    array.set(sBuy,i,false)
+                    array.set(sBrk,i,false)
+                    array.set(sFlp,i,true)
+                    array.set(sTouch,i,1)
+                    array.set(sDel,i,0.0)
+                    array.set(sOrig,i,bar_index)
+                    array.set(sLast,i,bar_index)
+                    array.set(sOrigVol,i,origV)
                     evtFlip := true
                 else if not buyShelf and touched and close > t + buf*0.5 and volOk
-                    array.set(sBuy,i,true);  array.set(sBrk,i,false)
-                    array.set(sFlp,i,true);  array.set(sTouch,i,1)
-                    array.set(sDel,i,0.0);   array.set(sOrig,i,bar_index)
-                    array.set(sLast,i,bar_index); array.set(sOrigVol,i,origV)
+                    array.set(sBuy,i,true)
+                    array.set(sBrk,i,false)
+                    array.set(sFlp,i,true)
+                    array.set(sTouch,i,1)
+                    array.set(sDel,i,0.0)
+                    array.set(sOrig,i,bar_index)
+                    array.set(sLast,i,bar_index)
+                    array.set(sOrigVol,i,origV)
                     evtFlip := true
 
 
@@ -699,7 +707,8 @@ if barstate.isconfirmed and not na(fp)
     f_rebuildRankCache()
 
     while array.size(bIdx) > lookback
-        array.shift(bIdx); array.shift(bDel)
+        array.shift(bIdx)
+        array.shift(bDel)
 
 
     // ═════════════════════════════════════════════════════════════════════
