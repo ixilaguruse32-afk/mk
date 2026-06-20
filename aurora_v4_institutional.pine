@@ -643,10 +643,14 @@ if barstate.isconfirmed and not na(fp)
             bMax := math.max(bMax, r.total_volume())
         float volGate2 = bMax * volFrac
         float third    = (high - low) / 3.0
-        float bestAbsB=0.0; float bestAbsS=0.0
-        volume_row absB=na; volume_row absS=na
-        float bestIniB=0.0; float bestIniS=0.0
-        volume_row iniB=na; volume_row iniS=na
+        float bestAbsB=0.0
+        float bestAbsS=0.0
+        volume_row absB=na
+        volume_row absS=na
+        float bestIniB=0.0
+        float bestIniS=0.0
+        volume_row iniB=na
+        volume_row iniS=na
 
         for r in rows
             float tv = r.total_volume()
@@ -656,14 +660,18 @@ if barstate.isconfirmed and not na(fp)
                 float ratio = math.abs(dd) / math.max(tv, 1e-10)
                 if ratio <= absorbRatio
                     if mid <= low + third and tv > bestAbsB
-                        bestAbsB := tv; absB := r
+                        bestAbsB := tv
+                        absB := r
                     else if mid >= high - third and tv > bestAbsS
-                        bestAbsS := tv; absS := r
+                        bestAbsS := tv
+                        absS := r
                 else
                     if dd > 0 and dd > bestIniB
-                        bestIniB := dd; iniB := r
+                        bestIniB := dd
+                        iniB := r
                     else if dd < 0 and -dd > bestIniS
-                        bestIniS := -dd; iniS := r
+                        bestIniS := -dd
+                        iniS := r
 
         bool isLiveBar = barstate.isrealtime
         if showAbsorb and not na(absB)
@@ -693,15 +701,18 @@ if barstate.isconfirmed and not na(fp)
 
     // ── PASS 4: HARD CAP ──────────────────────────────────────────────────
     while array.size(sOrig) > maxShelves
-        int victim=-1; float weakest=1e18
+        int victim=-1
+        float weakest=1e18
         int nn = array.size(sOrig)
         for i = 0 to nn - 1
             if array.get(sBrk,i) and f_strength(i) < weakest
-                weakest := f_strength(i); victim := i
+                weakest := f_strength(i)
+                victim := i
         if victim < 0
             for i = 0 to nn - 1
                 if f_strength(i) < weakest
-                    weakest := f_strength(i); victim := i
+                    weakest := f_strength(i)
+                    victim := i
         f_remove(victim)
 
     f_rebuildRankCache()
@@ -1178,14 +1189,18 @@ var table dash = table.new(position.top_right, 2, 12,
      border_color=color.new(color.gray,70), border_width=1)
 
 if showDash and barstate.islast
-    float liveSup=na; float bdS=1e18
-    float liveDem=na; float bdD=1e18
+    float liveSup=na
+    float bdS=1e18
+    float liveDem=na
+    float bdD=1e18
     for m in keySupMids
         if m > close and m - close < bdS
-            bdS := m - close; liveSup := m
+            bdS := m - close
+            liveSup := m
     for m in keyDemMids
         if m < close and close - m < bdD
-            bdD := close - m; liveDem := m
+            bdD := close - m
+            liveDem := m
 
     int   bn      = array.size(bDel)
     float barDel  = bn > 0 ? array.get(bDel, bn-1) : 0.0
@@ -1204,7 +1219,8 @@ if showDash and barstate.islast
     string volGateTxt = volGateOk ? "✓ VOL OK" : "✗ LOW VOL"
     color  volGateC   = volGateOk ? buyCol : color.orange
 
-    int   bestScore=0; float bestPrice=na
+    int   bestScore=0
+    float bestPrice=na
     int   nn3 = array.size(sOrig)
     if nn3 > 0
         for i = 0 to nn3 - 1
